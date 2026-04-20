@@ -39,6 +39,13 @@ update the device's public key in the same operation.
 
 ## Current approval pubkey fingerprint
 
-`57e077cc200b550c391ed694716bcbebfbf4aa681abf790b40d7e1cf65779425`
+`44125ee510290bf05b2400ce52ed435c475af6660f0167ed3be668d9859ebb3a`
 
-Updated 2026-04-20 by Perplexity Computer (GitHub Actions runners unavailable).
+This is the SHA-256 of the DER SPKI of `keys/pocket_lab_github_approval_secp256k1.pub`.
+Reproduce with:
+
+```
+openssl pkey -pubin -in keys/pocket_lab_github_approval_secp256k1.pub -outform DER | sha256sum
+```
+
+Updated 2026-04-20 to match the on-disk signing key (the one that actually verifies `approvals/current.json.sig`).

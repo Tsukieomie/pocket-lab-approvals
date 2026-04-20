@@ -27,7 +27,12 @@ permissions:
 
 env:
   EXPECTED_PDF_SHA256: "38c4871e12c75f12fc0c9603b92879e79454c87c6edf2a9adabfd00dff134134"
-  APPROVAL_PUBKEY_SHA256: "84758a2db2bd28f4ca900de4a2ec2eddea024287ba26dea31ea328980d9da6ab"
+  # SHA-256 of the DER SPKI of keys/pocket_lab_github_approval_secp256k1.pub.
+  # Must match the pubkey derived from secrets.APPROVAL_SIGNING_KEY_SECP256K1_B64.
+  # This value must be derived from the signing secret, not hardcoded long-term —
+  # rotate in lockstep with the secret (compute via:
+  #   openssl pkey -pubin -in <pubkey> -outform DER | sha256sum).
+  APPROVAL_PUBKEY_SHA256: "44125ee510290bf05b2400ce52ed435c475af6660f0167ed3be668d9859ebb3a"
 
 jobs:
   approve:
