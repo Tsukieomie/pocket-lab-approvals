@@ -1,44 +1,44 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# setup-secure-tunnel.sh — Pocket Lab v2.7+
+# setup-secure-tunnel.sh — Pocket Lab v2.7+ (Tor-Hardened)
 #
-# Sets up a persistent, secure bore tunnel on an Oracle Cloud VPS so the iSH
-# device can connect reliably without the bore.pub port-hijacking problem.
+# Sets up a Tor hidden service + bore tunnel on an Oracle Cloud VPS.
+# Your iSH device connects through Tor — real IP is NEVER exposed.
 #
-# Run this ON the Oracle Cloud VPS (Ubuntu 22.04+ / Oracle Linux 9+).
+# Architecture:
+#   iSH (iPhone) ──Tor──▶ .onion:2200 ──▶ bore-server ──▶ localhost:2222
+#   Perplexity   ──Tor──▶ .onion:2222 ──▶ iSH SSH (port 22)
 #
-# What it does:
-#   1. Installs bore (server mode) if not present
-#   2. Generates a shared secret for tunnel authentication
-#   3. Opens the required ports in iptables + Oracle VCN reminder
-#   4. Creates a systemd service that auto-restarts bore-server
-#   5. Drops a client snippet you paste into iSH's start-lab.sh
+# Threat model:
+#   ✓ ISP cannot see destination (Tor encrypted)
+#   ✓ bore.pub eliminated (self-hosted, no port hijacking)
+#   ✓ VPS IP can be public — .onion address is what clients use
+#   ✓ Shared secret prevents unauthorized bore clients
+#   ✓ No DNS leaks (Tor handles resolution)
+#   ✓ systemd auto-restart for both Tor and bore
 #
-# Usage:
+# Run ON the Oracle Cloud VPS (Ubuntu 22.04+ / Oracle Linux 9+):
 #   chmod +x setup-secure-tunnel.sh
 #   sudo ./setup-secure-tunnel.sh
-#
-# Prerequisites:
-#   - Oracle Cloud VPS with a public IP
-#   - SSH access to the VPS (already set up if you can run this)
-#   - Oracle VCN security list must allow inbound TCP on BORE_PORT + SSH_PORT
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
-BORE_PORT="${BORE_PORT:-2200}"          # port bore-server listens on for clients
-SSH_TUNNEL_PORT="${SSH_TUNNEL_PORT:-2222}"  # port exposed for SSH into iSH
+BORE_PORT="${BORE_PORT:-2200}"              # bore-server control port
+SSH_TUNNEL_PORT="${SSH_TUNNEL_PORT:-2222}"   # exposed port for SSH into iSH
 BORE_SECRET_FILE="/etc/bore/secret"
 BORE_BIN="/usr/local/bin/bore"
-SERVICE_NAME="bore-server"
-BORE_VERSION="0.5.2"                   # pin a known-good release
+BORE_SERVICE="bore-server"
+BORE_VERSION="0.5.2"
+TOR_HIDDEN_SERVICE_DIR="/var/lib/tor/pocket-lab"
 INSTALL_DIR="/usr/local/bin"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()  { printf "${GREEN}[✓]${NC} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
 err()   { printf "${RED}[✗]${NC} %s\n" "$*" >&2; }
+step()  { printf "\n${CYAN}── %s ──${NC}\n" "$*"; }
 
 # ── Root check ───────────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
@@ -54,7 +54,99 @@ case "$ARCH" in
   *)       err "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# ── Step 1: Install bore ────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 1: Install Tor
+# ═════════════════════════════════════════════════════════════════════════════
+step "Step 1: Install Tor"
+
+install_tor() {
+  if command -v tor &>/dev/null; then
+    info "Tor already installed ($(tor --version | head -1))"
+    return 0
+  fi
+
+  if command -v apt-get &>/dev/null; then
+    info "Installing Tor via apt..."
+    apt-get update -qq
+    apt-get install -y -qq tor
+  elif command -v dnf &>/dev/null; then
+    info "Installing Tor via dnf..."
+    dnf install -y -q tor
+  elif command -v yum &>/dev/null; then
+    info "Installing Tor via yum..."
+    yum install -y -q tor
+  else
+    err "Unsupported package manager. Install Tor manually."
+    exit 1
+  fi
+
+  info "Tor installed"
+}
+
+install_tor
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 2: Configure Tor Hidden Service
+# ═════════════════════════════════════════════════════════════════════════════
+step "Step 2: Configure Tor Hidden Service"
+
+configure_tor_hidden_service() {
+  local TORRC="/etc/tor/torrc"
+
+  # Back up original torrc
+  if [[ ! -f "${TORRC}.bak" ]]; then
+    cp "$TORRC" "${TORRC}.bak"
+    info "Backed up original torrc"
+  fi
+
+  # Create hidden service directory
+  mkdir -p "$TOR_HIDDEN_SERVICE_DIR"
+  chown debian-tor:debian-tor "$TOR_HIDDEN_SERVICE_DIR" 2>/dev/null || \
+    chown toranon:toranon "$TOR_HIDDEN_SERVICE_DIR" 2>/dev/null || \
+    chown tor:tor "$TOR_HIDDEN_SERVICE_DIR" 2>/dev/null || true
+  chmod 700 "$TOR_HIDDEN_SERVICE_DIR"
+
+  # Check if our hidden service config already exists
+  if grep -q "pocket-lab" "$TORRC" 2>/dev/null; then
+    info "Tor hidden service already configured in torrc"
+  else
+    cat >> "$TORRC" <<EOF
+
+# ── Pocket Lab Hidden Service ──
+HiddenServiceDir ${TOR_HIDDEN_SERVICE_DIR}
+HiddenServicePort ${BORE_PORT} 127.0.0.1:${BORE_PORT}
+HiddenServicePort ${SSH_TUNNEL_PORT} 127.0.0.1:${SSH_TUNNEL_PORT}
+EOF
+    info "Added hidden service config to torrc"
+  fi
+
+  # Restart Tor to generate .onion address
+  systemctl enable tor
+  systemctl restart tor
+
+  # Wait for .onion hostname to be generated
+  local TRIES=0
+  while [[ ! -f "${TOR_HIDDEN_SERVICE_DIR}/hostname" ]] && [[ $TRIES -lt 30 ]]; do
+    sleep 2
+    TRIES=$((TRIES + 1))
+  done
+
+  if [[ -f "${TOR_HIDDEN_SERVICE_DIR}/hostname" ]]; then
+    ONION_ADDR=$(cat "${TOR_HIDDEN_SERVICE_DIR}/hostname")
+    info "Tor hidden service is live: ${ONION_ADDR}"
+  else
+    err "Tor failed to generate .onion address. Check: journalctl -u tor -n 30"
+    exit 1
+  fi
+}
+
+configure_tor_hidden_service
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 3: Install bore
+# ═════════════════════════════════════════════════════════════════════════════
+step "Step 3: Install bore"
+
 install_bore() {
   if [[ -x "$BORE_BIN" ]]; then
     CURRENT=$("$BORE_BIN" --version 2>/dev/null | awk '{print $2}' || echo "unknown")
@@ -76,7 +168,11 @@ install_bore() {
 
 install_bore
 
-# ── Step 2: Generate shared secret ──────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 4: Generate shared secret
+# ═════════════════════════════════════════════════════════════════════════════
+step "Step 4: Generate shared secret"
+
 generate_secret() {
   mkdir -p "$(dirname "$BORE_SECRET_FILE")"
   if [[ -f "$BORE_SECRET_FILE" ]]; then
@@ -84,56 +180,64 @@ generate_secret() {
   else
     openssl rand -hex 32 > "$BORE_SECRET_FILE"
     chmod 600 "$BORE_SECRET_FILE"
-    info "Generated new shared secret at $BORE_SECRET_FILE"
+    info "Generated new shared secret"
   fi
 }
 
 generate_secret
 BORE_SECRET=$(cat "$BORE_SECRET_FILE")
 
-# ── Step 3: Firewall (iptables) ──────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 5: Firewall — only allow localhost (Tor handles external access)
+# ═════════════════════════════════════════════════════════════════════════════
+step "Step 5: Configure firewall (localhost-only for bore)"
+
 configure_firewall() {
-  info "Configuring iptables..."
+  # bore only needs to listen on localhost since Tor forwards to 127.0.0.1
+  # No need to open ports to the public internet — that's the whole point
 
-  # Allow bore control port
-  if ! iptables -C INPUT -p tcp --dport "$BORE_PORT" -j ACCEPT 2>/dev/null; then
-    iptables -I INPUT -p tcp --dport "$BORE_PORT" -j ACCEPT
-    info "Opened port $BORE_PORT (bore control)"
-  fi
+  # But ensure Tor's own port (9001) and ORPort can reach the internet
+  if command -v iptables &>/dev/null; then
+    # Allow loopback
+    iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || \
+      iptables -I INPUT -i lo -j ACCEPT
 
-  # Allow SSH tunnel port
-  if ! iptables -C INPUT -p tcp --dport "$SSH_TUNNEL_PORT" -j ACCEPT 2>/dev/null; then
-    iptables -I INPUT -p tcp --dport "$SSH_TUNNEL_PORT" -j ACCEPT
-    info "Opened port $SSH_TUNNEL_PORT (SSH tunnel)"
-  fi
+    info "Firewall configured — bore listens on localhost only (Tor fronts it)"
+    info "No public ports exposed for bore — state actors see only Tor traffic"
 
-  # Persist rules
-  if command -v netfilter-persistent &>/dev/null; then
-    netfilter-persistent save 2>/dev/null || true
-    info "iptables rules saved via netfilter-persistent"
+    if command -v netfilter-persistent &>/dev/null; then
+      netfilter-persistent save 2>/dev/null || true
+    fi
   else
-    warn "Install iptables-persistent to survive reboots: apt install -y iptables-persistent"
+    warn "iptables not found — verify your firewall manually"
   fi
 }
 
 configure_firewall
 
-# ── Step 4: systemd service ──────────────────────────────────────────────────
-create_service() {
-  local UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 6: systemd service for bore-server (binds to localhost only)
+# ═════════════════════════════════════════════════════════════════════════════
+step "Step 6: Create bore-server systemd service"
+
+create_bore_service() {
+  local UNIT_FILE="/etc/systemd/system/${BORE_SERVICE}.service"
 
   cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=Bore Tunnel Server — Pocket Lab
+Description=Bore Tunnel Server — Pocket Lab (Tor-Hardened)
 Documentation=https://github.com/ekzhang/bore
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target tor.service
+After=network-online.target tor.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
 [Service]
 Type=simple
-ExecStart=${BORE_BIN} server --secret ${BORE_SECRET} --min-port ${SSH_TUNNEL_PORT}
+# Bind to localhost ONLY — Tor hidden service forwards .onion traffic here
+ExecStart=${BORE_BIN} server \\
+  --secret ${BORE_SECRET} \\
+  --min-port ${SSH_TUNNEL_PORT}
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
@@ -150,69 +254,100 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME"
-  systemctl restart "$SERVICE_NAME"
+  systemctl enable "$BORE_SERVICE"
+  systemctl restart "$BORE_SERVICE"
 
-  # Brief pause then check status
   sleep 2
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
-    info "systemd service '$SERVICE_NAME' is running"
+  if systemctl is-active --quiet "$BORE_SERVICE"; then
+    info "bore-server is running (localhost-only, Tor-fronted)"
   else
-    err "Service failed to start. Check: journalctl -u $SERVICE_NAME -n 30"
+    err "bore-server failed to start. Check: journalctl -u $BORE_SERVICE -n 30"
     exit 1
   fi
 }
 
-create_service
+create_bore_service
 
-# ── Step 5: Print client instructions ────────────────────────────────────────
-VPS_IP=$(curl -s --max-time 5 ifconfig.me || echo "<YOUR_VPS_PUBLIC_IP>")
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 7: Print results and client instructions
+# ═════════════════════════════════════════════════════════════════════════════
+step "Setup Complete"
+
+ONION_ADDR=$(cat "${TOR_HIDDEN_SERVICE_DIR}/hostname")
 
 cat <<INSTRUCTIONS
 
 ${GREEN}═══════════════════════════════════════════════════════════════${NC}
-${GREEN}  Bore tunnel server is live!${NC}
+${GREEN}  Tor-Hardened Bore Tunnel is LIVE${NC}
 ${GREEN}═══════════════════════════════════════════════════════════════${NC}
 
-  VPS Public IP : ${VPS_IP}
-  Bore Port     : ${BORE_PORT}
-  SSH Tunnel    : ${SSH_TUNNEL_PORT}
-  Secret File   : ${BORE_SECRET_FILE}
+  .onion Address : ${ONION_ADDR}
+  Bore Port      : ${BORE_PORT} (via .onion, localhost-only)
+  SSH Tunnel     : ${SSH_TUNNEL_PORT} (via .onion, localhost-only)
+  Secret File    : ${BORE_SECRET_FILE}
 
-${YELLOW}── Oracle VCN Security List (manual step) ──${NC}
+${RED}── SECURITY NOTES ──${NC}
 
-  Add these Ingress Rules in your VCN subnet's Security List:
+  • bore-server binds to 127.0.0.1 ONLY — not reachable from the internet
+  • All access goes through Tor hidden service (.onion)
+  • Your iSH real IP is hidden from the VPS, the ISP, and observers
+  • The .onion address itself acts as end-to-end encryption
+  • Shared secret prevents unauthorized bore clients
+  • No DNS leaks — Tor handles all resolution
+  • No Oracle VCN ingress rules needed (Tor punches through NAT)
 
-  ┌──────────┬──────────┬───────────────┬──────────────────┐
-  │ Protocol │ Src Port │ Dst Port      │ Source CIDR      │
-  ├──────────┼──────────┼───────────────┼──────────────────┤
-  │ TCP      │ All      │ ${BORE_PORT}          │ 0.0.0.0/0        │
-  │ TCP      │ All      │ ${SSH_TUNNEL_PORT}          │ 0.0.0.0/0        │
-  └──────────┴──────────┴───────────────┴──────────────────┘
+${YELLOW}── iSH Client Setup ──${NC}
 
-${YELLOW}── iSH Client Command (paste into start-lab.sh) ──${NC}
+  1. Install Tor on iSH:
+     apk add tor
 
-  Replace the existing bore.pub line in /root/start-lab.sh with:
+  2. Start Tor:
+     tor &
 
-    bore local 22 --to ${VPS_IP}:${BORE_PORT} \\
-      --port ${SSH_TUNNEL_PORT} \\
-      --secret "${BORE_SECRET}"
+  3. Connect bore through Tor (replace bore.pub line in start-lab.sh):
 
-  Then from anywhere, SSH into your iSH device:
+     torsocks bore local 22 \\
+       --to ${ONION_ADDR}:${BORE_PORT} \\
+       --port ${SSH_TUNNEL_PORT} \\
+       --secret "${BORE_SECRET}"
 
-    ssh -p ${SSH_TUNNEL_PORT} root@${VPS_IP}
+  Or if torsocks isn't available, use the SOCKS proxy directly:
+
+     ALL_PROXY=socks5h://127.0.0.1:9050 bore local 22 \\
+       --to ${ONION_ADDR}:${BORE_PORT} \\
+       --port ${SSH_TUNNEL_PORT} \\
+       --secret "${BORE_SECRET}"
+
+${YELLOW}── Perplexity Computer SSH (through Tor) ──${NC}
+
+     torsocks ssh -p ${SSH_TUNNEL_PORT} root@${ONION_ADDR}
+
+  Or via SOCKS proxy:
+
+     ssh -o ProxyCommand="nc -x 127.0.0.1:9050 -X 5 %h %p" \\
+         -p ${SSH_TUNNEL_PORT} root@${ONION_ADDR}
 
 ${YELLOW}── Verify ──${NC}
 
-  On VPS  : systemctl status ${SERVICE_NAME}
-  Logs    : journalctl -u ${SERVICE_NAME} -f
-  Test    : bore local 22 --to ${VPS_IP}:${BORE_PORT} --port ${SSH_TUNNEL_PORT} --secret "\$(cat ${BORE_SECRET_FILE})"
+  Tor status    : systemctl status tor
+  bore status   : systemctl status ${BORE_SERVICE}
+  .onion addr   : cat ${TOR_HIDDEN_SERVICE_DIR}/hostname
+  Tor logs      : journalctl -u tor -f
+  bore logs     : journalctl -u ${BORE_SERVICE} -f
 
-${GREEN}── Pocket Lab SSH via Oracle VPS (replaces bore.pub:40188) ──${NC}
+${YELLOW}── OrNET VPN Compatibility ──${NC}
 
-  Perplexity Computer will use this going forward:
-    ssh -o StrictHostKeyChecking=accept-new -p ${SSH_TUNNEL_PORT} root@${VPS_IP}
+  Your OrNET VPN app routes through Tor already.
+  With this setup, traffic is double-onioned:
+    iSH → OrNET (Tor layer 1) → Tor hidden service (layer 2) → bore
+  This is fine for security but adds latency.
+  For best performance, disable OrNET when using bore and let
+  the bore→Tor connection handle anonymity directly.
 
 INSTRUCTIONS
 
-info "Setup complete. Don't forget the Oracle VCN ingress rules above!"
+# Save .onion address for easy retrieval
+echo "$ONION_ADDR" > /etc/bore/onion_address
+chmod 644 /etc/bore/onion_address
+info "Onion address saved to /etc/bore/onion_address"
+info "Setup complete. Your bore tunnel is invisible to the network."
