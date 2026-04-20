@@ -1,0 +1,94 @@
+name: Verify Approval
+
+on:
+  pull_request:
+    paths:
+      - 'approvals/**'
+  push:
+    branches: [main]
+    paths:
+      - 'approvals/**'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify-approval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - name: Verify approval artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBKEY="keys/pocket_lab_github_approval_secp256k1.pub"
+          APPROVAL="approvals/current.json"
+          SIG="approvals/current.json.sig"
+          EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+          # 1. Absent -> pass (no live approval is a valid state).
+          if [ ! -f "$APPROVAL" ]; then
+            echo "No approvals/current.json present — nothing to verify."
+            exit 0
+          fi
+
+          # 2. Placeholder with "approved": false -> pass.
+          APPROVED=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("approved"))' "$APPROVAL")
+          if [ "$APPROVED" != "True" ]; then
+            echo "approvals/current.json has \"approved\": false — placeholder, skipping verification."
+            exit 0
+          fi
+
+          # 3. Pubkey pinning: fingerprint inside JSON must match the on-disk key.
+          if [ ! -f "$PUBKEY" ]; then
+            echo "FAIL: pubkey file missing at $PUBKEY" >&2
+            exit 1
+          fi
+          COMPUTED_SHA=$(openssl pkey -pubin -in "$PUBKEY" -outform DER | sha256sum | awk '{print $1}')
+          DECLARED_SHA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["approval_pubkey_sha256"])' "$APPROVAL")
+          if [ "$COMPUTED_SHA" != "$DECLARED_SHA" ]; then
+            echo "FAIL: approval_pubkey_sha256 mismatch." >&2
+            echo "  on-disk pubkey SHA-256 (DER SPKI): $COMPUTED_SHA" >&2
+            echo "  declared in current.json:          $DECLARED_SHA" >&2
+            exit 1
+          fi
+
+          # 4. Signature verification.
+          if [ ! -f "$SIG" ]; then
+            echo "FAIL: signature file missing at $SIG" >&2
+            exit 1
+          fi
+          if ! openssl dgst -sha256 -verify "$PUBKEY" -signature "$SIG" "$APPROVAL"; then
+            echo "FAIL: openssl signature verification failed for $APPROVAL" >&2
+            exit 1
+          fi
+
+          # 5. Expiry sanity: expires_at_utc must be > approved_at_utc + 10s and < approved_at_utc + 1h.
+          python3 - "$APPROVAL" <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+
+          path = sys.argv[1]
+          o = json.load(open(path))
+          approved = datetime.strptime(o["approved_at_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+          expires  = datetime.strptime(o["expires_at_utc"],  "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+          delta = (expires - approved).total_seconds()
+          if delta <= 10:
+              print(f"FAIL: expires_at_utc - approved_at_utc = {delta}s (must be > 10s; zero-validity artifact detected)", file=sys.stderr)
+              sys.exit(1)
+          if delta >= 3600:
+              print(f"FAIL: expires_at_utc - approved_at_utc = {delta}s (must be < 3600s; absurd TTL)", file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: validity window = {delta}s")
+          PY
+
+          # 6. Nonce must not be sha256("") sentinel.
+          NONCE=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["nonce_sha256"])' "$APPROVAL")
+          if [ "$NONCE" = "$EMPTY_SHA" ]; then
+            echo "FAIL: nonce_sha256 equals sha256(\"\") — empty/unbound nonce, replay-vulnerable." >&2
+            exit 1
+          fi
+
+          echo "All approval checks passed."

@@ -27,20 +27,29 @@ permissions:
 
 env:
   EXPECTED_PDF_SHA256: "38c4871e12c75f12fc0c9603b92879e79454c87c6edf2a9adabfd00dff134134"
-  APPROVAL_PUBKEY_SHA256: "84758a2db2bd28f4ca900de4a2ec2eddea024287ba26dea31ea328980d9da6ab"
+  # SHA-256 of the DER SPKI of keys/pocket_lab_github_approval_secp256k1.pub.
+  # Must match the pubkey derived from secrets.APPROVAL_SIGNING_KEY_SECP256K1_B64.
+  # This value must be derived from the signing secret, not hardcoded long-term —
+  # rotate in lockstep with the secret (compute via:
+  #   openssl pkey -pubin -in <pubkey> -outform DER | sha256sum).
+  APPROVAL_PUBKEY_SHA256: "44125ee510290bf05b2400ce52ed435c475af6660f0167ed3be668d9859ebb3a"
 
 jobs:
   approve:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
       - name: Validate input
         shell: bash
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          PDF_SHA: ${{ inputs.pdf_sha256 }}
+          MINUTES: ${{ inputs.valid_minutes }}
         run: |
           set -euo pipefail
-          test "${{ inputs.confirm }}" = "APPROVE"
-          test "${{ inputs.pdf_sha256 }}" = "$EXPECTED_PDF_SHA256"
-          case "${{ inputs.valid_minutes }}" in 1|3|5) ;; *) exit 2 ;; esac
+          test "$CONFIRM" = "APPROVE"
+          test "$PDF_SHA" = "$EXPECTED_PDF_SHA256"
+          case "$MINUTES" in 1|3|5) ;; *) exit 2 ;; esac
       - name: Install signing key
         shell: bash
         env:
@@ -52,41 +61,51 @@ jobs:
           chmod 600 approval_signing_key.pem
       - name: Create and sign approval
         shell: bash
+        env:
+          NONCE: ${{ inputs.nonce }}
+          PDF_SHA: ${{ inputs.pdf_sha256 }}
+          MINUTES: ${{ inputs.valid_minutes }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           mkdir -p approvals
           APPROVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          EXPIRES_AT=$(date -u -d "+${{ inputs.valid_minutes }} minutes" +%Y-%m-%dT%H:%M:%SZ)
-          NONCE_SHA=$(printf '%s' '${{ inputs.nonce }}' | sha256sum | awk '{print $1}')
-          cat > approvals/current.json <<JSON
-          {
-            "schema": "pocket_lab_signed_approval_v1",
-            "approved": true,
-            "pdf_sha256": "${{ inputs.pdf_sha256 }}",
-            "nonce_sha256": "$NONCE_SHA",
-            "approved_by": "${{ github.actor }}",
-            "approved_at_utc": "$APPROVED_AT",
-            "expires_at_utc": "$EXPIRES_AT",
-            "repo": "${{ github.repository }}",
-            "run_id": "${{ github.run_id }}",
-            "approval_pubkey_sha256": "$APPROVAL_PUBKEY_SHA256",
-            "signature_algorithm": "ECDSA-secp256k1-SHA256"
+          EXPIRES_AT=$(date -u -d "+$MINUTES minutes" +%Y-%m-%dT%H:%M:%SZ)
+          NONCE_SHA=$(printf '%s' "$NONCE" | sha256sum | awk '{print $1}')
+          APPROVED_AT="$APPROVED_AT" EXPIRES_AT="$EXPIRES_AT" NONCE_SHA="$NONCE_SHA" python3 - <<'PY'
+          import json, os
+          obj = {
+              "schema": "pocket_lab_signed_approval_v1",
+              "approved": True,
+              "pdf_sha256": os.environ["PDF_SHA"],
+              "nonce_sha256": os.environ["NONCE_SHA"],
+              "approved_by": os.environ["ACTOR"],
+              "approved_at_utc": os.environ["APPROVED_AT"],
+              "expires_at_utc": os.environ["EXPIRES_AT"],
+              "repo": os.environ["REPO"],
+              "run_id": os.environ["RUN_ID"],
+              "approval_pubkey_sha256": os.environ["APPROVAL_PUBKEY_SHA256"],
+              "signature_algorithm": "ECDSA-secp256k1-SHA256",
           }
-          JSON
-          python3 - <<'PY'
-          import json
-          p='approvals/current.json'
-          o=json.load(open(p))
-          open(p,'w').write(json.dumps(o, sort_keys=True, separators=(',',':'))+'\n')
+          with open("approvals/current.json", "w") as f:
+              f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
           PY
           openssl dgst -sha256 -sign approval_signing_key.pem -out approvals/current.json.sig approvals/current.json
           sha256sum approvals/current.json > approvals/current.json.sha256
       - name: Commit signed approval files
         shell: bash
+        env:
+          PDF_SHA: ${{ inputs.pdf_sha256 }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add approvals/current.json approvals/current.json.sig approvals/current.json.sha256
-          git commit -m "Signed Pocket Lab unlock approval for ${{ inputs.pdf_sha256 }}" || true
+          git commit -m "Signed Pocket Lab unlock approval for $PDF_SHA" || true
           git push origin HEAD:main
+      - name: Clean up signing key
+        if: always()
+        shell: bash
+        run: rm -f approval_signing_key.pem

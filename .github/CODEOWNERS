@@ -1,0 +1,7 @@
+# Default owner for everything in the repo.
+* @Tsukieomie
+
+# Security-critical paths: explicit ownership for the trust chain.
+/approvals/         @Tsukieomie
+/.github/workflows/ @Tsukieomie
+/keys/              @Tsukieomie
