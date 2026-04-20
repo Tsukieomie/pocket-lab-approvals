@@ -27,7 +27,7 @@ permissions:
 
 env:
   EXPECTED_PDF_SHA256: "38c4871e12c75f12fc0c9603b92879e79454c87c6edf2a9adabfd00dff134134"
-  APPROVAL_PUBKEY_SHA256: "6d79d6ca48496718229a5fb94c73809e2cdc4723e8e4c0bbf78dc50e66a9b61b"
+  APPROVAL_PUBKEY_SHA256: "84758a2db2bd28f4ca900de4a2ec2eddea024287ba26dea31ea328980d9da6ab"
 
 jobs:
   approve:
@@ -44,11 +44,11 @@ jobs:
       - name: Install signing key
         shell: bash
         env:
-          APPROVAL_SIGNING_KEY_B64: ${{ secrets.APPROVAL_SIGNING_KEY_B64 }}
+          APPROVAL_SIGNING_KEY_SECP256K1_B64: ${{ secrets.APPROVAL_SIGNING_KEY_SECP256K1_B64 }}
         run: |
           set -euo pipefail
-          test -n "$APPROVAL_SIGNING_KEY_B64"
-          printf '%s' "$APPROVAL_SIGNING_KEY_B64" | base64 -d > approval_signing_key.pem
+          test -n "$APPROVAL_SIGNING_KEY_SECP256K1_B64"
+          printf '%s' "$APPROVAL_SIGNING_KEY_SECP256K1_B64" | base64 -d > approval_signing_key.pem
           chmod 600 approval_signing_key.pem
       - name: Create and sign approval
         shell: bash
@@ -69,7 +69,8 @@ jobs:
             "expires_at_utc": "$EXPIRES_AT",
             "repo": "${{ github.repository }}",
             "run_id": "${{ github.run_id }}",
-            "approval_pubkey_sha256": "$APPROVAL_PUBKEY_SHA256"
+            "approval_pubkey_sha256": "$APPROVAL_PUBKEY_SHA256",
+            "signature_algorithm": "ECDSA-secp256k1-SHA256"
           }
           JSON
           python3 - <<'PY'
@@ -78,7 +79,7 @@ jobs:
           o=json.load(open(p))
           open(p,'w').write(json.dumps(o, sort_keys=True, separators=(',',':'))+'\n')
           PY
-          openssl pkeyutl -sign -inkey approval_signing_key.pem -rawin -in approvals/current.json -out approvals/current.json.sig
+          openssl dgst -sha256 -sign approval_signing_key.pem -out approvals/current.json.sig approvals/current.json
           sha256sum approvals/current.json > approvals/current.json.sha256
       - name: Commit signed approval files
         shell: bash
