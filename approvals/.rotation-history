@@ -1,0 +1,6 @@
+# Pocket Lab — Approval Key Rotation Ledger
+# Format: timestamp | old_pubkey_sha256 | new_pubkey_sha256 | actor | reason
+# This file is append-only. Each line is a signed rotation event.
+# Verify chain: each new_pubkey signed the approval that contains it.
+#
+2026-04-20T16:15:24Z | 57e077cc200b550c391ed694716bcbebfbf4aa681abf790b40d7e1cf65779425 | 8fdcd3a50486581e75a0d374af505fa4795a98b71aa31c01ad96f88d2c667489 | Perplexity-Computer-v2.7 | GitHub Actions runners unavailable; Path B direct signing
