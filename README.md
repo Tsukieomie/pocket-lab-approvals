@@ -39,6 +39,6 @@ update the device's public key in the same operation.
 
 ## Current approval pubkey fingerprint
 
-`57e077cc200b550c391ed694716bcbebfbf4aa681abf790b40d7e1cf65779425`
+`736138dafde81db852a768c6839119a9885e4f4098b2ca7f98a76ed216e6b392`
 
-Updated 2026-04-20 by Perplexity Computer (GitHub Actions runners unavailable).
+Updated 2026-04-22 by Perplexity Computer (Path B direct signing).
