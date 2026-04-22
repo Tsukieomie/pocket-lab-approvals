@@ -53,7 +53,7 @@ if [ -f "$_BORE_ENV" ]; then
   BORE_SECRET=$(grep '^BORE_SECRET=' "$_BORE_ENV" | cut -d= -f2 || echo "")
   GH_TOKEN=$(grep '^GH_TOKEN=' "$_BORE_ENV" | cut -d= -f2 || echo "")
 else
-  BORE_HOST="bore.pub"; BORE_PORT="40188"; SSH_KEY_PATH=""; BORE_SECRET=""; GH_TOKEN=""
+  BORE_HOST="bore.pub"; BORE_PORT="2222"; SSH_KEY_PATH=""; BORE_SECRET=""; GH_TOKEN=""
 fi
 echo "$BORE_HOST" > /tmp/bore_host.txt
 echo "$BORE_PORT" > /tmp/bore_port.txt

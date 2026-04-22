@@ -17,7 +17,7 @@ When GitHub Actions runners are unavailable (`startup_failure`), Perplexity Comp
 can generate the keypair, sign the approval JSON directly, and push it here — then
 update the device's public key in the same operation.
 
-**To trigger Path B:** SSH into iSH via bore.pub and ask Perplexity Computer to open the lab.
+**To trigger Path B:** SSH into iSH via bore.pub (no Oracle VPS needed) and ask Perplexity Computer to open the lab.
 
 ## Approval JSON schema
 
